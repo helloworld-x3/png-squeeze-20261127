@@ -299,36 +299,7 @@ function chooseBands(candidates, rowLength, height, bandHeight, lookahead = 0) {
   return raw;
 }
 
-function refineBands(original, filtered, rowLength) {
-  const raw = Buffer.from(original);
-  const span = 8 * rowLength;
-  const context = 8 * rowLength;
-  const scratch = Buffer.allocUnsafe(span + context);
-  for (let start = 0; start < raw.length; start += span) {
-    const end = Math.min(start + span, raw.length);
-    const horizon = Math.min(end + context, raw.length);
-    const trial = scratch.subarray(0, horizon - start);
-    raw.copy(trial, 0, start, horizon);
-    const dictionary = raw.subarray(Math.max(0, start - 32768), start);
-    const options = { level: 4, dictionary };
-    let minBytes = deflateRawSync(trial, options).length;
-    let bestBand;
-    for (const candidate of filtered) {
-      const band = candidate.subarray(start, end);
-      if (band.equals(raw.subarray(start, end))) continue;
-      band.copy(trial);
-      const size = deflateRawSync(trial, options).length;
-      if (size < minBytes) {
-        minBytes = size;
-        bestBand = band;
-      }
-    }
-    if (bestBand) bestBand.copy(raw, start);
-  }
-  return raw;
-}
-
-function compress(image) {
+function compress(image, extra) {
   const finalists = [];
   for (const encoding of encodings(image)) {
     const { width, height } = image;
@@ -341,44 +312,40 @@ function compress(image) {
     const ranked = sources.map(trial);
     const simpleSize = Math.min(...ranked.map(({ stream }) => stream.length)) + overhead;
     if (finalists.length && simpleSize > finalists[0].size * 1.18) continue;
-    for (const rows of BAND_HEIGHTS) ranked.push(trial(chooseBands(sources, rowLength, height, rows)));
-    ranked.sort((a, b) => a.stream.length - b.stream.length);
-    if (encoding.type !== 3) {
-      ranked.push(trial(chooseBands(sources, rowLength, height, 6, 6)));
-      ranked.push(trial(refineBands(ranked[0].raw, filtered, rowLength)));
-      ranked.sort((a, b) => a.stream.length - b.stream.length);
+    for (const rows of BAND_HEIGHTS) {
+      ranked.push(trial(chooseBands(sources, rowLength, height, rows)));
     }
-
-    for (const [i, candidate] of ranked.slice(0, 4).entries()) {
-      const { raw } = candidate;
-      const streams = [candidate.stream, deflateSync(raw, { level: 9 })];
-      if (i < 2) {
-        streams.push(deflateSync(raw, { level: 9, memLevel: 9, strategy: constants.Z_FILTERED }));
-        streams.push(deflateSync(raw, { level: 9, memLevel: 9 }));
+    if (encoding.type !== 3) ranked.push(trial(chooseBands(sources, rowLength, height, 6, 6)));
+    ranked.sort((a, b) => a.stream.length - b.stream.length);
+    for (const [index, candidate] of ranked.slice(0, 2).entries()) {
+      const { raw, stream: quick } = candidate;
+      const streams = [quick, deflateSync(raw, { level: 9 })];
+      if (index === 0 && encoding.type !== 3) {
+        streams.push(deflateSync(raw, { level: 8, strategy: constants.Z_FILTERED }));
       }
-      let stream = streams[0];
+      let stream = quick;
       for (const next of streams) if (next.length < stream.length) stream = next;
+      const alternate = streams.find((next) => !stream.equals(next));
       const size = overhead + stream.length;
       if (finalists.length === 2 && size >= finalists[1].size) continue;
-      const equivalent = finalists.findIndex((finalist) => raw.equals(finalist.raw));
-      const alternate = streams.find((next) => !next.equals(stream));
-      const result = { size, encoding, stream, alternate, raw, rowLength, overhead };
-      if (equivalent === -1) finalists.push(result);
-      else if (size < finalists[equivalent].size) finalists[equivalent] = result;
+      const duplicate = finalists.findIndex((other) => raw.equals(other.raw));
+      const result = { size, overhead, encoding, stream, alternate, raw, rowLength };
+      if (duplicate < 0) finalists.push(result);
+      else if (size < finalists[duplicate].size) finalists[duplicate] = result;
       finalists.sort((a, b) => a.size - b.size);
       if (finalists.length > 2) finalists.pop();
     }
   }
 
   let best = finalists[0];
-  for (const [rank, candidate] of finalists.entries()) {
-    const { raw, rowLength, encoding, overhead } = candidate;
-    // Bound the extra search by image work and the native stream's size.
-    const margin = raw.length <= (1 << 20) ? 1.12 : 1.04;
-    if (candidate.stream.length * 3 >= raw.length || candidate.size > finalists[0].size * margin) continue;
-    const primary = rank === 0;
-    const optimised = optimiseDeflate(raw, rowLength, encoding.bpp, best.size - overhead, primary ? 3 : 1,
-      candidate.stream, primary ? candidate.alternate : undefined);
+  for (const [rank, { raw, rowLength, encoding, stream, alternate, overhead, size }] of finalists.entries()) {
+    if (stream.length * 3 >= raw.length) continue;
+    if (rank) {
+      // Spend a fixed amount of extra work across the set, independent of timing.
+      if (raw.length > extra.remaining || size > finalists[0].size * 1.04) continue;
+      extra.remaining -= raw.length;
+    }
+    const optimised = optimiseDeflate(raw, rowLength, encoding.bpp, best.size - overhead, stream, alternate);
     if (optimised && inflateSync(optimised, { maxOutputLength: raw.length }).equals(raw)) {
       best = { encoding, stream: optimised, size: overhead + optimised.length };
     }
@@ -388,10 +355,11 @@ function compress(image) {
 
 const input = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const output = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+const extra = { remaining: 3 * 1024 * 1024 };
 for (let index = 1; index <= 8; index++) {
   const id = `i${String(index).padStart(3, '0')}`;
   const image = readScreenshot(readFileSync(join(input, id, 'image.png')));
-  const answer = compress(image);
+  const answer = compress(image, extra);
   const target = join(output, id);
   mkdirSync(target, { recursive: true });
   writeFileSync(join(target, 'image.png'), answer);

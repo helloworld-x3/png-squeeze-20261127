@@ -16,29 +16,58 @@ const LENGTH_CODE = lookupCodes(LENGTH_BASE);
 const DISTANCE_CODE = lookupCodes(DISTANCE_BASE);
 const MATCH_LIMIT = 258;
 const WINDOW = 32768;
-const MATCH_INDEX_BITS = 18;
-const MATCH_INDEX_SIZE = 1 << MATCH_INDEX_BITS;
-const CHAIN = new Int32Array(WINDOW);
-const HEAD = new Int32Array(MATCH_INDEX_SIZE);
-const RUN_HEAD = new Int32Array(MATCH_INDEX_SIZE);
-const SHORT_PREFIX_HEAD = new Int32Array(MATCH_INDEX_SIZE);
-const PREFIX_HEAD = new Int32Array(MATCH_INDEX_SIZE);
-let matchScratch;
+const MAX_TOKENS = 245_000;
+const MAX_POSITIONS = 285_000;
+const MAX_EDGES = 2_750_000;
+const MATCH_OPTIONS = 12;
+const HASH_SIZE = 1 << 16;
 
-function scratchFor(size) {
-  if (matchScratch && matchScratch.runs.length >= size) return matchScratch;
-  const capacity = 2 ** (32 - Math.clz32(size - 1));
-  matchScratch = {
-    runs: new Uint16Array(capacity),
-    nearest: new Uint32Array(capacity),
-    nearby: new Uint32Array(capacity),
-    medium: new Uint32Array(capacity),
-    longest: new Uint32Array(capacity),
-    decisions: new Uint32Array(capacity),
-    hints: new Uint16Array(capacity),
-    alternateHints: new Uint16Array(capacity),
-  };
-  return matchScratch;
+function tokenPositions(tokens) {
+  const positions = new Uint32Array(tokens.length + 1);
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    positions[i + 1] = positions[i] + (token < 256 ? 1 : token & 511);
+  }
+  return positions;
+}
+
+function mergePositions(first, second, expand) {
+  if (!second) return first;
+  const positions = new Uint32Array(MAX_POSITIONS);
+  let i = 1, j = 1, count = 1;
+  while (i < first.length || j < second.length) {
+    const point = Math.min(first[i] ?? Infinity, second[j] ?? Infinity);
+    const previous = positions[count - 1];
+    const gap = point - previous;
+    const padding = expand ? Math.min(5, (gap - 1) >> 1) : gap >= 8 ? 1 : 0;
+    if (count + 2 * padding >= positions.length) {
+      return expand ? mergePositions(first, second, false) : first;
+    }
+    for (let k = 1; k <= padding; k++) positions[count++] = previous + k;
+    for (let k = padding; k > 0; k--) positions[count++] = point - k;
+    positions[count++] = point;
+    if (first[i] === point) i++;
+    if (second[j] === point) j++;
+  }
+  return positions.subarray(0, count);
+}
+
+function addMatchEnds(positions, longest) {
+  const ends = new Uint32Array(positions.length);
+  let count = 0;
+  for (let i = 0; i + 1 < positions.length; i++) {
+    if (longest[i] >= 8) ends[count++] = positions[i] + longest[i];
+  }
+  const sorted = ends.subarray(0, count).sort();
+  const merged = new Uint32Array(positions.length + count);
+  let a = 0, b = 0, size = 0;
+  while (a < positions.length || b < count) {
+    const point = Math.min(positions[a] ?? Infinity, sorted[b] ?? Infinity);
+    if (point !== merged[size - 1]) merged[size++] = point;
+    if (positions[a] === point) a++;
+    while (sorted[b] === point) b++;
+  }
+  return merged.subarray(0, size);
 }
 
 function matchLength(bytes, words, runs, pos, earlier, limit) {
@@ -58,166 +87,98 @@ function matchLength(bytes, words, runs, pos, earlier, limit) {
   return length;
 }
 
-function findMatches(bytes, rowLength, bpp, nativeStream, alternateStream) {
-  const size = bytes.length;
-  const words = new DataView(bytes.buffer, bytes.byteOffset, size);
-  // Searches run serially. Reuse their large tables and copy out only the
-  // actual token sequences, which are usually much shorter than the input.
-  const scratch = scratchFor(size);
-  const { runs, nearest, nearby, medium, longest, hints, alternateHints } = scratch;
-  hints.fill(0, 0, size);
-  if (nativeStream) collectMatchHints(nativeStream, hints.subarray(0, size));
-  if (alternateStream) collectMatchHints(alternateStream, alternateHints.fill(0, 0, size).subarray(0, size));
-  let remaining = 0;
-  for (let pos = size - 1; pos >= 0; pos--) {
-    remaining = bytes[pos] === bytes[pos + 1] ? Math.min(MATCH_LIMIT, remaining + 1) : 1;
-    runs[pos] = remaining;
-  }
-
-  const chain = CHAIN;
-  const head = HEAD.fill(-1);
-  const runHead = RUN_HEAD.fill(-1);
-  const shortPrefixHead = SHORT_PREFIX_HEAD.fill(-1);
-  const prefixHead = PREFIX_HEAD.fill(-1);
-  longest.fill(0, Math.max(0, size - 2), size);
-  const mask = WINDOW - 1;
-  const mediumRadius = Math.max(2048, 2 * rowLength);
-  for (let pos = 0; pos + 2 < size; pos++) {
-    const key = (bytes[pos] << 16) | (bytes[pos + 1] << 8) | bytes[pos + 2];
-    const hash = Math.imul(key, 0x9e3779b1) >>> (32 - MATCH_INDEX_BITS);
-    const previousHead = head[hash];
-    let previous = previousHead;
-    head[hash] = pos;
-    const boundary = Math.max(0, pos - WINDOW);
-    const limit = Math.min(MATCH_LIMIT, size - pos);
-    const run = runs[pos];
-
-    if (run === MATCH_LIMIT && pos > 0 && bytes[pos - 1] === bytes[pos]) {
-      const fill = (1 << 9) | MATCH_LIMIT;
-      nearest[pos] = nearby[pos] = medium[pos] = longest[pos] = fill;
-      chain[pos & mask] = previousHead;
-      continue;
-    }
-
-    let maxLength = 0, maxDistance = 0;
-    const previousMatch = pos ? longest[pos - 1] : 0;
-    if ((previousMatch & 511) > 3) {
-      // Shifting both sides of the previous match preserves every byte after
-      // its first, including matches that have fallen out of the short chain.
-      maxDistance = previousMatch >>> 9;
-      maxLength = (previousMatch & 511) - 1;
-      if (maxLength === MATCH_LIMIT - 1 && limit === MATCH_LIMIT &&
-          bytes[pos + maxLength] === bytes[pos + maxLength - maxDistance]) maxLength++;
-    }
-    let nearLength = maxLength, nearDistance = maxDistance;
-    let midLength = maxDistance <= 256 ? maxLength : 0;
-    let midDistance = midLength ? maxDistance : 0;
-    let mediumLength = maxDistance <= mediumRadius ? maxLength : 0;
-    let mediumDistance = mediumLength ? maxDistance : 0;
-    let alignedRun = -1;
-    if (run >= 3 && run < MATCH_LIMIT && pos + run + 2 < size) {
-      // Group starts with the same run length and following bytes. This exposes
-      // split runs that a short chain of identical three-byte heads would hide.
-      const suffix = (bytes[pos + run] << 16) | (bytes[pos + run + 1] << 8) | bytes[pos + run + 2];
-      const runKey = suffix ^ (run << 15) ^ (bytes[pos] << 7);
-      const runHash = Math.imul(runKey, 0x85ebca6b) >>> (32 - MATCH_INDEX_BITS);
-      alignedRun = runHead[runHash];
-      runHead[runHash] = pos;
-    }
-
-    let shortPrefix = -1, longerPrefix = -1;
-    const firstWord = limit >= 5 && run < 12 ? Math.imul(words.getUint32(pos), 0x9e3779b1) : 0;
-    if (limit >= 5 && run < 5) {
-      const hash5 = (firstWord ^ Math.imul(bytes[pos + 4], 0x85ebca6b)) >>> (32 - MATCH_INDEX_BITS);
-      shortPrefix = shortPrefixHead[hash5];
-      shortPrefixHead[hash5] = pos;
-    }
-    if (limit >= 12 && run < 12) {
-      // A longer prefix can surface matches buried in a crowded 3-byte chain.
-      const hash12 = (firstWord ^
-        Math.imul(words.getUint32(pos + 4), 0x85ebca6b) ^ Math.imul(words.getUint32(pos + 8), 0xc2b2ae35)) >>> (32 - MATCH_INDEX_BITS);
-      longerPrefix = prefixHead[hash12];
-      prefixHead[hash12] = pos;
-    }
-
-    const chainLimit = run >= 3 ? 6 : 24;
-    for (let probe = alternateStream ? -8 : -7; probe < chainLimit; probe++) {
-      let earlier;
-      if (probe === -8) {
-        const distance = alternateHints[pos];
-        if (!distance || distance === hints[pos]) continue;
-        earlier = pos - distance;
-      } else if (probe === -7) {
-        if (!hints[pos]) continue;
-        earlier = pos - hints[pos];
-      } else if (probe === -6) earlier = pos - bpp;
-      else if (probe === -5) earlier = pos - rowLength;
-      else if (probe === -4) earlier = pos - 2 * rowLength;
-      else if (probe === -3) earlier = alignedRun;
-      else if (probe === -2) earlier = shortPrefix;
-      else if (probe === -1) earlier = longerPrefix;
-      else {
-        earlier = previous;
-        if (earlier < boundary) break;
-        previous = chain[earlier & mask];
-      }
-      if (earlier < boundary) continue;
-      const distance = pos - earlier;
-      if (probe >= 0 && maxLength === limit && distance >= maxDistance && distance >= nearDistance &&
-          (distance > 256 || (midLength === limit && distance >= midDistance)) &&
-          (distance > mediumRadius || (mediumLength === limit && distance >= mediumDistance))) break;
-      const canImproveNear = nearDistance === 0 || distance < nearDistance;
-      const canImproveMid = distance <= 256 && (distance < midDistance ||
-        (midLength < limit && bytes[pos + midLength] === bytes[earlier + midLength]));
-      const canImproveMedium = distance <= mediumRadius && (distance < mediumDistance ||
-        (mediumLength < limit && bytes[pos + mediumLength] === bytes[earlier + mediumLength]));
-      const canImproveBest = distance < maxDistance ||
-        (maxLength < limit && bytes[pos + maxLength] === bytes[earlier + maxLength]);
-      if (!canImproveNear && !canImproveMid && !canImproveMedium && !canImproveBest) continue;
-      const length = matchLength(bytes, words, runs, pos, earlier, limit);
-      if (length < 3) continue;
-      if (canImproveNear) {
-        nearLength = length;
-        nearDistance = distance;
-      }
-      if (distance <= 256 && (length > midLength || (length === midLength && distance < midDistance))) {
-        midLength = length;
-        midDistance = distance;
-      }
-      if (distance <= mediumRadius && (length > mediumLength || (length === mediumLength && distance < mediumDistance))) {
-        mediumLength = length;
-        mediumDistance = distance;
-      }
-      if (length > maxLength || (length === maxLength && distance < maxDistance)) {
-        maxLength = length;
-        maxDistance = distance;
-      }
-      if (length === limit && distance === 1) break;
-    }
-
-    // Save the previous head even if probing moved farther down the chain.
-    chain[pos & mask] = previousHead;
-    nearest[pos] = (nearDistance << 9) | nearLength;
-    nearby[pos] = midLength > nearLength ? (midDistance << 9) | midLength : nearest[pos];
-    medium[pos] = mediumLength > (nearby[pos] & 511) ? (mediumDistance << 9) | mediumLength : nearby[pos];
-    longest[pos] = (maxDistance << 9) | maxLength;
-  }
-  return scratch;
+function hintedDistance(tokens, positions, index, pos) {
+  const token = tokens[index];
+  if (token >= 256) return token >>> 9;
+  if (positions[index + 1] - pos <= 2) return tokens[index + 1] >>> 9;
+  return 0;
 }
 
-function greedyTokens(bytes, { longest, decisions: tokens }) {
-  let count = 0;
-  for (let pos = 0; pos < bytes.length;) {
-    const match = longest[pos];
-    const length = match & 511;
-    if (length >= 3 && (length >= 64 || (longest[pos + 1] & 511) <= length + 1)) {
-      tokens[count++] = match;
-      pos += length;
-    } else {
-      tokens[count++] = bytes[pos++];
-    }
+function shortHash(bytes, pos) {
+  const key = (bytes[pos] << 16) | (bytes[pos + 1] << 8) | bytes[pos + 2];
+  return Math.imul(key, 0x9e3779b1) >>> 16;
+}
+
+function longHash(words, pos) {
+  return (Math.imul(words.getUint32(pos), 0x85ebca6b) ^ Math.imul(words.getUint32(pos + 4), 0xc2b2ae35)) >>> 16;
+}
+
+function runHash(bytes, pos, length) {
+  const end = pos + length;
+  const suffix = (bytes[end] << 16) | (bytes[end + 1] << 8) | bytes[end + 2];
+  return Math.imul(suffix ^ (length << 15) ^ (bytes[pos] << 7), 0x85ebca6b) >>> 16;
+}
+
+function matchOptions(bytes, rowLength, bpp, positions, first, firstEnds, second, secondEnds) {
+  const words = new DataView(bytes.buffer, bytes.byteOffset, bytes.length);
+  const runs = new Uint16Array(bytes.length);
+  let remaining = 0;
+  for (let p = bytes.length - 1; p >= 0; p--) {
+    remaining = bytes[p] === bytes[p + 1] ? Math.min(MATCH_LIMIT, remaining + 1) : 1;
+    runs[p] = remaining;
   }
-  return tokens.slice(0, count);
+  const options = new Uint32Array(positions.length * MATCH_OPTIONS);
+  const counts = new Uint8Array(positions.length);
+  const longest = new Uint16Array(positions.length);
+  const shortHeads = new Int32Array(HASH_SIZE).fill(-1);
+  const longHeads = new Int32Array(HASH_SIZE).fill(-1);
+  const runHeads = new Int32Array(HASH_SIZE).fill(-1);
+  const shortChain = new Int32Array(WINDOW);
+  const probes = new Int32Array(MATCH_OPTIONS);
+  const mask = WINDOW - 1;
+  let a = 0, b = 0, indexed = 0;
+  for (let i = 0; i + 1 < positions.length; i++) {
+    const pos = positions[i];
+    const limit = Math.min(MATCH_LIMIT, bytes.length - pos);
+    if (limit < 3) break;
+    while (firstEnds[a + 1] <= pos) a++;
+    while (second && secondEnds[b + 1] <= pos) b++;
+    const from = Math.max(0, pos - WINDOW);
+    // The dictionary may refer to any byte, even though the parse only visits
+    // selected positions. Index every source with constant work per byte.
+    while (indexed < pos) {
+      const short = shortHash(bytes, indexed);
+      shortChain[indexed & mask] = shortHeads[short];
+      shortHeads[short] = indexed;
+      const run = runs[indexed];
+      if (run < 8 && indexed + 8 <= bytes.length) longHeads[longHash(words, indexed)] = indexed;
+      if (run >= 3 && run < MATCH_LIMIT && indexed + run + 2 < bytes.length) runHeads[runHash(bytes, indexed, run)] = indexed;
+      indexed++;
+    }
+    probes[0] = pos - 1;
+    probes[1] = pos - bpp;
+    probes[2] = pos - rowLength;
+    probes[3] = pos - 2 * rowLength;
+    probes[4] = pos - hintedDistance(first, firstEnds, a, pos);
+    probes[5] = second ? pos - hintedDistance(second, secondEnds, b, pos) : -1;
+    let prev = shortHeads[shortHash(bytes, pos)];
+    for (let k = 6; k < 10; k++) {
+      probes[k] = prev;
+      prev = prev > from ? shortChain[prev & mask] : -1;
+    }
+    const run = runs[pos];
+    probes[10] = limit >= 8 && run < 8 ? longHeads[longHash(words, pos)] : -1;
+    probes[11] = run >= 3 && run < MATCH_LIMIT && pos + run + 2 < bytes.length ? runHeads[runHash(bytes, pos, run)] : -1;
+
+    const base = i * MATCH_OPTIONS;
+    let count = 0;
+    for (let index = 0; index < probes.length; index++) {
+      const earlier = probes[index];
+      if (earlier < from || earlier >= pos) continue;
+      const distance = pos - earlier;
+      let duplicate = false;
+      for (let j = 0; j < count; j++) if ((options[base + j] >>> 9) === distance) duplicate = true;
+      if (duplicate) continue;
+      const length = matchLength(bytes, words, runs, pos, earlier, limit);
+      if (length >= 3) {
+        options[base + count++] = (distance << 9) | length;
+        longest[i] = Math.max(longest[i], length);
+        if (distance === 1 && length === limit) break;
+      }
+    }
+    counts[i] = count;
+  }
+  return { options, counts, longest };
 }
 
 function countSymbols(tokens) {
@@ -377,9 +338,7 @@ function decodingTable(lengths) {
 const FIXED_LITERALS = decodingTable(Uint8Array.from({ length: 288 }, (_, i) => i < 144 ? 8 : i < 256 ? 9 : i < 280 ? 7 : 8));
 const FIXED_DISTANCES = decodingTable(new Uint8Array(32).fill(5));
 
-function collectMatchHints(stream, hints) {
-  // The native compressor tries a different match search. Import its distance
-  // choices and test them alongside the byte-equality checks in findMatches.
+function readNativeTokens(stream, bytes) {
   let bit = 16;
   const bitEnd = (stream.length - 4) * 8;
   const peek = (width) => {
@@ -403,6 +362,7 @@ function collectMatchHints(stream, hints) {
     return entry >>> 4;
   };
 
+  const tokens = [];
   let cursor = 0;
   let last;
   do {
@@ -413,6 +373,9 @@ function collectMatchHints(stream, hints) {
       const length = read(16);
       if (read(16) !== (length ^ 65535)) throw new Error('Invalid native stored block');
       advance(length * 8);
+      if (tokens.length + length > MAX_TOKENS) return null;
+      if (cursor + length > bytes.length) throw new Error('Native stored block is outside the input');
+      for (let i = cursor; i < cursor + length; i++) tokens.push(bytes[i]);
       cursor += length;
       continue;
     }
@@ -445,7 +408,9 @@ function collectMatchHints(stream, hints) {
     for (;;) {
       const literal = nextSymbol(literals);
       if (literal === 256) break;
+      if (tokens.length === MAX_TOKENS) return null;
       if (literal < 256) {
+        tokens.push(literal);
         cursor++;
         continue;
       }
@@ -455,14 +420,13 @@ function collectMatchHints(stream, hints) {
       const dc = nextSymbol(distances);
       if (dc >= DISTANCE_EXTRA.length) throw new Error('Invalid native match distance');
       const distance = DISTANCE_BASE[dc] + read(DISTANCE_EXTRA[dc]);
-      if (distance > cursor || cursor + length > hints.length) throw new Error('Native match is outside the input');
-      const preceding = Math.max(distance, cursor - 2);
-      for (let i = cursor - 1; i >= preceding && hints[i] === 0; i--) hints[i] = distance;
-      hints.fill(distance, cursor, cursor + length);
+      if (distance > cursor || cursor + length > bytes.length) throw new Error('Native match is outside the input');
+      tokens.push((distance << 9) | length);
       cursor += length;
     }
   } while (!last);
-  if (cursor !== hints.length) throw new Error('Native stream has the wrong input length');
+  if (cursor !== bytes.length) throw new Error('Native stream has the wrong input length');
+  return Uint32Array.from(tokens);
 }
 
 function encodeLengthRuns(lengths) {
@@ -559,122 +523,87 @@ function describeBlock(tokens, stats) {
   return { tokens, lit, dist, litCount, distCount, ...header, bits };
 }
 
-const RING = 512;
-const RING_MASK = RING - 1;
 const COST_UNIT = 8;
-const DISTANCE_PRICES = new Uint32Array(WINDOW + 1);
-const MINIMA = new Float64Array(9 * RING);
 
 function estimatedCosts(counts, total, lengths, exact) {
   return Uint16Array.from(counts, (frequency, i) => {
     if (exact && frequency) return lengths[i] * COST_UNIT;
-    const entropy = Math.log2((total + counts.length) / (1 + frequency));
-    const estimate = lengths[i] && frequency ? (lengths[i] + Math.min(16, entropy)) / 2 : Math.min(16, entropy);
+    const entropy = Math.min(16, Math.log2((total + counts.length) / (1 + frequency)));
+    const estimate = frequency ? (lengths[i] + entropy) / 2 : entropy;
     return Math.max(1, Math.round(estimate * COST_UNIT));
   });
 }
 
-function lengthPriceRanges(prices) {
-  const ends = new Uint16Array(259);
-  const costs = new Uint32Array(259);
-  let maxWidth = 1;
-  for (let first = 3; first <= MATCH_LIMIT;) {
-    const price = prices[LENGTH_CODE[first]];
-    let end = first + 1;
-    while (end <= MATCH_LIMIT && prices[LENGTH_CODE[end]] === price) end++;
-    ends.fill(end - 1, first, end);
-    costs.fill(price, first, end);
-    maxWidth = Math.max(maxWidth, end - first);
-    first = end;
-  }
-  return { ends, costs, layers: 32 - Math.clz32(maxWidth) };
-}
-
-function optimiseTokens(bytes, matches, start, stop, seed, stats, exact) {
+function optimiseTokens(bytes, positions, graph, start, stop, seed, stats, budget, exact) {
+  const { options, counts, longest, costs, next, distances } = graph;
   const literal = estimatedCosts(stats.literals, seed.tokens.length + 1, seed.lit, exact);
   const distance = estimatedCosts(stats.distances, stats.matches, seed.dist, exact);
-  const length = lengthPriceRanges(LENGTH_EXTRA.map((extra, i) => RING * (literal[257 + i] + COST_UNIT * extra)));
-  const distanceCost = DISTANCE_PRICES;
-  for (let code = 0; code < DISTANCE_EXTRA.length; code++) {
-    distanceCost.fill(RING * (distance[code] + COST_UNIT * DISTANCE_EXTRA[code]), DISTANCE_BASE[code], DISTANCE_BASE[code + 1]);
-  }
-  const chosen = matches.decisions;
-  const minima = MINIMA.fill(Infinity, 0, length.layers * RING);
-  minima[stop & RING_MASK] = stop & RING_MASK;
-
-  for (let pos = stop - 1; pos >= start; pos--) {
-    const slot = pos & RING_MASK;
-    let best = RING * literal[bytes[pos]] + minima[(slot + 1) & RING_MASK];
-    let choice = bytes[pos];
-    const maxMatch = matches.longest[pos];
-    const upper = Math.min(maxMatch & 511, stop - pos);
-    if (upper >= 3) {
-      const mediumMatch = matches.medium[pos];
-      const midMatch = matches.nearby[pos];
-      const nearMatch = matches.nearest[pos];
-      const furthest = maxMatch >>> 9;
-      const mediumDist = mediumMatch >>> 9;
-      const midDist = midMatch >>> 9;
-      const nearDist = nearMatch >>> 9;
-      const mediumLimit = Math.min(mediumMatch & 511, upper);
-      const midLimit = Math.min(midMatch & 511, mediumLimit);
-      const nearLimit = Math.min(nearMatch & 511, midLimit);
-      const bestMedium = distanceCost[mediumDist] <= distanceCost[furthest] ? mediumDist : furthest;
-      const bestMid = distanceCost[midDist] <= distanceCost[bestMedium] ? midDist : bestMedium;
-      const bestNear = distanceCost[nearDist] <= distanceCost[bestMid] ? nearDist : bestMid;
-
-      // One distance price applies to each interval of reachable lengths.
-      // Adjacent lengths with the same price can share a query for the
-      // cheapest suffix in that range in constant time using rolling minima.
-      for (let from = 3; from <= upper;) {
-        let to, dist;
-        if (from <= nearLimit && bestNear !== bestMid) {
-          to = nearLimit;
-          dist = bestNear;
-        } else if (from <= midLimit && bestMid !== bestMedium) {
-          to = midLimit;
-          dist = bestMid;
-        } else if (from <= mediumLimit && bestMedium !== furthest) {
-          to = mediumLimit;
-          dist = bestMedium;
-        } else {
-          to = upper;
-          dist = furthest;
-        }
-        const distBits = distanceCost[dist];
-        while (from <= to) {
-          const end = Math.min(to, length.ends[from]);
-          const power = 31 - Math.clz32(end - from + 1);
-          const layer = power * RING;
-          const left = minima[layer + ((slot + from) & RING_MASK)];
-          const right = minima[layer + ((slot + end + 1 - (1 << power)) & RING_MASK)];
-          const endpoint = Math.min(left, right);
-          const value = endpoint + length.costs[from] + distBits;
-          if (value < best) {
-            best = value;
-            choice = (dist << 9) | (((endpoint & RING_MASK) - slot) & RING_MASK);
+  const lengthPrice = Uint16Array.from(LENGTH_EXTRA, (extra, i) => literal[257 + i] + COST_UNIT * extra);
+  const distancePrice = Uint16Array.from(DISTANCE_EXTRA, (extra, i) => distance[i] + COST_UNIT * extra);
+  const prices = new Uint16Array(MATCH_OPTIONS);
+  let remaining = budget.remaining;
+  costs[stop] = 0;
+  for (let i = stop - 1; i >= start; i--) {
+    const pos = positions[i];
+    const following = positions[i + 1];
+    let best = costs[i + 1];
+    for (let byte = pos; byte < following; byte++) best += literal[bytes[byte]];
+    let bestNext = i + 1;
+    let bestDistance = 0;
+    const end = Math.min(pos + longest[i], positions[stop]);
+    if (end >= following) {
+      const base = i * MATCH_OPTIONS;
+      const optionsCount = counts[i];
+      for (let k = 0; k < optionsCount; k++) prices[k] = distancePrice[DISTANCE_CODE[options[base + k] >>> 9]];
+      let target = i + 1;
+      while (target <= stop && positions[target] - pos < 3) target++;
+      while (target <= stop && positions[target] <= end) {
+        const length = positions[target] - pos;
+        let cheapest = Infinity;
+        let chosenDistance = 0;
+        let reach = 0;
+        for (let k = 0; k < optionsCount; k++) {
+          const match = options[base + k];
+          const limit = match & 511;
+          if (limit >= length && (prices[k] < cheapest || (prices[k] === cheapest && limit > reach))) {
+            cheapest = prices[k];
+            chosenDistance = match >>> 9;
+            reach = limit;
           }
-          from = end + 1;
+        }
+        // The cheapest distance stays valid until its match length expires.
+        const boundary = Math.min(end, pos + reach);
+        while (target <= stop && positions[target] <= boundary) {
+          if (--remaining < 0) {
+            budget.remaining = 0;
+            return null;
+          }
+          const span = positions[target] - pos;
+          const cost = costs[target] + cheapest + lengthPrice[LENGTH_CODE[span]];
+          if (cost < best) {
+            best = cost;
+            bestNext = target;
+            bestDistance = chosenDistance;
+          }
+          target++;
         }
       }
     }
-    chosen[pos - start] = choice;
-    // The low bits retain the winning suffix's index for reconstructing tokens.
-    minima[slot] = best - (best & RING_MASK) + slot;
-    for (let layer = 1, half = 1; layer < length.layers; layer++, half <<= 1) {
-      const base = (layer - 1) * RING;
-      minima[base + RING + slot] = Math.min(minima[base + slot], minima[base + ((slot + half) & RING_MASK)]);
-    }
+    next[i] = bestNext;
+    distances[i] = bestDistance;
+    costs[i] = best;
   }
+  budget.remaining = remaining;
 
-  // Output indices stay at or behind the next decision, so compact in place.
-  let count = 0;
-  for (let at = 0; at < stop - start;) {
-    const token = chosen[at];
-    chosen[count++] = token;
-    at += token < 256 ? 1 : token & 511;
+  const tokens = [];
+  for (let i = start; i < stop; i = next[i]) {
+    const pos = positions[i];
+    const end = positions[next[i]];
+    const distance = distances[i];
+    if (distance) tokens.push((distance << 9) | (end - pos));
+    else for (let byte = pos; byte < end; byte++) tokens.push(bytes[byte]);
   }
-  return chosen.slice(0, count);
+  return Uint32Array.from(tokens);
 }
 
 class BitWriter {
@@ -768,22 +697,41 @@ function refineBoundaries(tokens, blocks) {
   }
 }
 
-export function optimiseDeflate(bytes, rowLength, bpp, maxBytes, passes, nativeStream, alternateStream) {
+export function optimiseDeflate(bytes, rowLength, bpp, maxBytes, nativeStream, alternateStream) {
   if (bytes.length === 0 || maxBytes < 7) return null;
-  const matches = findMatches(bytes, rowLength, bpp, nativeStream, alternateStream);
-  const greedy = greedyTokens(bytes, matches);
-  const initial = splitBlocks(greedy, GROUP_SIZE);
-  let blocks = initial.map(({ start, stop, tokens }) => {
+  const native = readNativeTokens(nativeStream, bytes);
+  if (!native) return null;
+  const alternate = alternateStream ? readNativeTokens(alternateStream, bytes) : null;
+  // A full byte-by-byte search is expensive on long repeated spans. Native
+  // token boundaries retain both parses while keeping the graph small.
+  const nativePositions = tokenPositions(native);
+  const alternatePositions = alternate && tokenPositions(alternate);
+  let positions = mergePositions(nativePositions, alternatePositions, native.length <= 62_000);
+  let paths = matchOptions(bytes, rowLength, bpp, positions, native, nativePositions, alternate, alternatePositions);
+  const refine = bytes.length <= (1 << 20) && positions.length <= 110_000;
+  if (refine) {
+    // Match ends expose useful cut positions that neither native parse used.
+    positions = addMatchEnds(positions, paths.longest);
+    paths = matchOptions(bytes, rowLength, bpp, positions, native, nativePositions, alternate, alternatePositions);
+  }
+  const graph = {
+    ...paths,
+    costs: new Float64Array(positions.length),
+    next: new Uint32Array(positions.length),
+    distances: new Uint16Array(positions.length),
+  };
+  const budget = { remaining: refine ? 3_600_000 : MAX_EDGES };
+  const passes = positions.length <= 140_000 ? 2 : 1;
+  let end = 0;
+  let blocks = splitBlocks(native, GROUP_SIZE).map(({ stop, tokens }) => {
+    const start = end;
+    while (positions[end] < stop) end++;
     let stats = countSymbols(tokens);
     let seed = describeBlock(tokens, stats);
     let best = seed;
-    for (let iteration = 0; iteration < passes; iteration++) {
-      const exact = iteration === 2;
-      if (exact && best !== seed) {
-        seed = best;
-        stats = countSymbols(seed.tokens);
-      }
-      const optimised = optimiseTokens(bytes, matches, start, stop, seed, stats, exact);
+    for (let iteration = 0; iteration < passes && budget.remaining > 0; iteration++) {
+      const optimised = optimiseTokens(bytes, positions, graph, start, end, seed, stats, budget, iteration > 0);
+      if (!optimised) break;
       stats = countSymbols(optimised);
       seed = describeBlock(optimised, stats);
       if (seed.bits < best.bits) best = seed;
